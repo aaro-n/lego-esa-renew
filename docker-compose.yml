@@ -1,0 +1,35 @@
+services:
+  lego-esa-renew:
+    build:
+      context: .
+    image: lego-esa-renew
+    container_name: lego-esa-renew
+    environment:
+      # 设置申请的证书存储在 certs 文件夹
+      - CERT_PATH=certs
+      # 设置 Lego 用阿里云DNS申请通配符证书，具体请参考 Lego文档
+      - ALICLOUD_ACCESS_KEY=LTAaxzzc
+      - ALICLOUD_SECRET_KEY=asdsdff
+      # 用 Lego 申请证书所使用的邮件地址
+      - EMAIL=example@example.com
+      # 用 Lego 为那些域名申请证书
+      - DOMAIN=domain1.com,*.domain1.com,domain2.com,*.domain2.com,domain3.com,*.domain3.com,domain4.com,*.domain4.com,domain5.com,*.domain5.com,domain6.com,*.domain6.com,domain7.com,*.domain7.com,domain8.com,*.domain8.com,domain9.com,*.domain9.com,domain10.com,*.domain10.com,actions.github.domain10.com
+      # Lego 运行方式，是申请证书（run）还是续签证书
+      # 参数： run 或 renew
+      # 首次申请证书使用 run
+      - RENEW_OPTION=run
+      # 阿里云上传并更新 ESA 所需要的参数
+      - ALICLOUD_ACCESS_KEY_ID=werrt
+      - ALICLOUD_ACCESS_KEY_SECRET=ssdsdfffg
+      # 阿里云上传证书到哪里，中国大陆（cn-hangzhou）或海外（ap-southeast-1）
+      # 参数： cn-hangzhou 或 ap-southeast-1
+      # 阿里云国际版ESA账户一般用 ap-southeast-1
+      - ALIYUN_REGION=ap-southeast-1
+      # 上传到阿里云证书的文件名
+      # 实际上传的文件名是文件名+日期
+      # 例子：NAME变量为lego-ssl，时间是20250801，则上传到阿里云的证书名为lego-ssl-20250801
+      - NAME=lego-ssl
+    volumes:
+      # /home/www/certs 的certs文件夹名要根据 CERT_PATH 变量来
+      # ./CERT_PATH:/home/www/CERT_PATH
+      - ./certs:/home/www/certs

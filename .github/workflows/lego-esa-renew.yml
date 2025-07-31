@@ -1,0 +1,224 @@
+name: 续签 SSL 证书上传到阿里云并更新阿里云ESA证书
+
+on:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: "13 7 */7 * *"  # 每 7 天的 7:13 AM 触发
+
+jobs:
+  request-cert:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 检出代码
+      - name: 检出代码
+        uses: actions/checkout@v2
+
+      # 安装 Lego
+      - name: 安装 Lego
+        run: |
+          # 获取最新版本信息
+          latest_version=$(curl -s https://api.github.com/repos/go-acme/lego/releases/latest | grep '"tag_name"' | sed -E 's/.*"([^"]+)".*/\1/')
+    
+          # 构建下载链接
+          download_url="https://github.com/go-acme/lego/releases/download/${latest_version}/lego_${latest_version}_linux_amd64.tar.gz"
+    
+          # 下载并安装 Lego
+          wget -O lego_linux_amd64.tar.gz "$download_url"
+          tar -xzf lego_linux_amd64.tar.gz
+          sudo mv lego /usr/local/bin/
+          sudo chmod +x /usr/local/bin/lego
+
+      # 使用 Lego 续签 SSL 证书
+      - name: 使用 Lego 续签 SSL 证书
+        env:
+          DOMAIN: ${{ secrets.DOMAIN }}
+          EMAIL: ${{ secrets.EMAIL }}
+          ALICLOUD_ACCESS_KEY: ${{ secrets.ALICLOUD_ACCESS_KEY }}
+          ALICLOUD_SECRET_KEY: ${{ secrets.ALICLOUD_SECRET_KEY }}
+          CERT_PATH: ${{ secrets.CERT_PATH }}  # 从环境变量读取证书路径
+          RENEW_OPTION: ${{ secrets.RENEW_OPTION }}  # 从环境变量读取续订选项
+        run: |
+          CERT_PATH="${CERT_PATH:-certs}"  # 默认为 certs
+          RENEW_OPTION="${RENEW_OPTION:-renew}"  # 默认为 renew
+          
+          lego --email="$EMAIL" --domains="$DOMAIN" --path="./$CERT_PATH"  --dns alidns $RENEW_OPTION
+
+      # 检查续签证书文件是否变更
+      - name: 检查续签证书文件是否变更
+        id: check_changes
+        env:
+          CERT_PATH: ${{ secrets.CERT_PATH }}  # 从环境变量读取证书路径
+        run: |
+          CERT_PATH="${CERT_PATH:-certs}"  # 默认为 certs
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          git add ./$CERT_PATH
+          if ! git diff --cached --quiet; then
+            echo "检测到证书变更."
+            echo "changed=true" >> $GITHUB_ENV
+          else
+            echo "未检测到证书变更."
+            echo "changed=false" >> $GITHUB_ENV
+          fi
+
+      # 将续签证书提交并推送到 Github
+      - name: 将续签证书提交并推送到 Github
+        if: env.changed == 'true'
+        env:
+          CERT_PATH: ${{ secrets.CERT_PATH }}  # 从环境变量读取证书路径
+        run: |
+          CERT_PATH="${CERT_PATH:-certs}"  # 默认为 certs
+          git add $CERT_PATH
+          current_time=$(TZ='Asia/Shanghai' date "+%Y-%m-%d %H:%M:%S")
+          git commit -m "证书更新时间 - 北京时间: $current_time"
+          git push origin main
+
+      # 安装阿里云 CLI 为上传证书更新ESA证书做准备
+      - name: 安装阿里云 CLI 为上传证书更新ESA证书做准备
+        if: env.changed == 'true'
+        run: |
+          curl -L https://aliyuncli.alicdn.com/aliyun-cli-linux-latest-amd64.tgz -o aliyun-cli.tgz
+          tar -xzf aliyun-cli.tgz
+          sudo mv aliyun /usr/local/bin/
+          sudo chmod +x /usr/local/bin/aliyun
+
+      # 配置阿里云 CLI
+      - name: 配置阿里云 CLI
+        if: env.changed == 'true'
+        env:
+          ALICLOUD_ACCESS_KEY_ID: ${{ secrets.ALICLOUD_ACCESS_KEY_ID }}
+          ALICLOUD_ACCESS_KEY_SECRET: ${{ secrets.ALICLOUD_ACCESS_KEY_SECRET }}
+          ALIYUN_REGION: ${{ secrets.ALIYUN_REGION }}  # 从环境变量读取区域
+        run: |
+          REGION="${ALIYUN_REGION:-ap-southeast-1}"  # 默认为 ap-southeast-1
+          aliyun configure set --access-key-id "$ALICLOUD_ACCESS_KEY_ID" --access-key-secret "$ALICLOUD_ACCESS_KEY_SECRET" --region "$REGION"
+
+      # 读取 ssl-certid 文件内容，获取 CertId
+      - name: 获取 CertId
+        if: env.changed == 'true'
+        run: |
+          CertId=$(grep '"CertId"' ssl-certid | sed -E 's/.*: ([0-9]+).*/\1/')
+          echo "CertId=${CertId}" >> $GITHUB_ENV
+
+      # 删除之前的证书
+      - name: 删除之前的证书
+        if: env.changed == 'true'
+        run: |
+          CertId=${{ env.CertId }}
+          aliyun cas DeleteUserCertificate --CertId "${CertId}"
+
+      # 将新证书上传到阿里云并将执行日志写入 ssl-certid 文件
+      - name: 将新证书上传到阿里云并将执行日志写入 ssl-certid 文件
+        if: env.changed == 'true'
+        env:
+          CERT_PATH: ${{ secrets.CERT_PATH }}  # 从环境变量读取证书路径
+          NAME: ${{ secrets.NAME }}  # 从环境变量读取证书名称
+        run: |
+          CERT_PATH="${CERT_PATH:-certs}"  # 默认为 certs
+          NAME="${NAME:-lego-ssl}"  # 默认为 lego-ssl
+          
+          # 获取当前日期，格式为 YYYYMMDD
+          CURRENT_DATE=$(date +"%Y%m%d")
+          NAME="$NAME-$CURRENT_DATE"  # 将日期附加到证书名称
+
+          # 获取证书文件名
+          FILENAME=$(ls ./$CERT_PATH/certificates/*.json | sed 's|.*/||;s|\.json||')
+          
+          # 输出 FILENAME 变量的值
+          echo "FILENAME: $FILENAME"
+          
+          # 上传证书
+          aliyun cas UploadUserCertificate \
+            --Cert "$(cat ./$CERT_PATH/certificates/${FILENAME}.crt)" \
+            --Key "$(cat ./$CERT_PATH/certificates/${FILENAME}.key)" \
+            --Name "$NAME" > ssl-certid
+
+      # 将 ssl-certid 文件上传到 GitHub
+      - name: 上传 ssl-certid 到 GitHub
+        if: env.changed == 'true'
+        run: |
+          git add ssl-certid
+          current_time=$(TZ='Asia/Shanghai' date "+%Y-%m-%d %H:%M:%S")
+          git commit -m "更新时间 - 北京时间: $current_time"
+          git push origin main
+
+      # 读取 SITE_ID 环境变量并写入 site-id 文件
+      - name: 读取 SITE_ID 环境变量并写入 site-id 文件为之后更新 SITE_ID 变量做准备 
+        if: env.changed == 'true'
+        env:
+          SITE_ID: ${{ secrets.SITE_ID }}  # 从环境变量读取 SITE-ID
+        run: |
+          echo "$SITE_ID" > site-id
+
+      # 检查 site-id 文件是否有变更并上传
+      - name: 检查并上传 site-id 到 GitHub
+        if: env.changed == 'true'
+        run: |
+          set +e  # 忽略错误
+          # 检查 site-id 文件是否有变化
+          git diff --exit-code site-id
+          if [ $? -ne 0 ]; then
+            echo "site-id 文件已更改."
+            git add site-id
+            current_time=$(TZ='Asia/Shanghai' date "+%Y-%m-%d %H:%M:%S")
+            git commit -m "更新时间 - 北京时间: $current_time"
+            git push origin main
+          else
+            echo "未检测到 site-id 文件变更. 跳过上传."
+          fi
+
+      # 读取 ssl-certid 文件内容，获取新的证书 CertId
+      - name: 获取新证书的 CertId
+        if: env.changed == 'true'
+        run: |
+          CertId=$(grep '"CertId"' ssl-certid | sed -E 's/.*: ([0-9]+).*/\1/')
+          echo "CertId=${CertId}" >> $GITHUB_ENV
+
+      # ESA绑定新上传的证书
+      - name: ESA绑定新上传的证书
+        if: env.changed == 'true'
+        env:
+          SITE_ID: ${{ secrets.SITE_ID }}  # 从环境变量读取 SITE-ID
+          CertId: ${{ env.CertId }}  # 从上一步中获取 CertId
+          NAME: ${{ secrets.NAME }}  # 从环境变量读取证书名称
+          ALIYUN_REGION: ${{ secrets.ALIYUN_REGION }}  # 从环境变量读取区域
+        run: |
+          REGION="${ALIYUN_REGION:-ap-southeast-1}"  # 默认为 ap-southeast-1
+          CertId=${{ env.CertId }}     
+          NAME="${NAME:-lego-ssl}"  # 默认为 lego-ssl
+          
+          # 获取当前日期，格式为 YYYYMMDD
+          CURRENT_DATE=$(date +"%Y%m%d")
+          NAME="$NAME-$CURRENT_DATE"  # 将日期附加到证书名称
+
+          # 过滤掉注释和空行，然后将 ID 转换为数组
+          site_ids=$(echo "$SITE_ID" | grep -v '^#' | grep -v '^ ' | tr '\n' ',' | sed 's/,$//')
+          IFS=',' read -r -a site_ids_array <<< "$site_ids"
+          
+          # 显示变量的值
+          echo "站点 ID: ${site_ids_array[@]}"
+          echo "证书名称: $NAME"
+          echo "证书 ID: $CertId"
+          
+          # 遍历 site_ids 数组并执行命令
+          for site_id in "${site_ids_array[@]}"; do
+           echo "正在为站点 ID 执行命令: $site_id"
+           aliyun esa SetCertificate --SiteId "$site_id" --Name "$NAME" --Type cas --CasId "$CertId" --Region "$REGION"
+          done
+          
+      # 写入时间到文件
+      - name: 将当前时间写入文件
+        run: echo $(date +"%Y-%m-%d %H:%M:%S") > time
+
+      # 提交和推送时间更改
+      - name: 提交并推送时间更改
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          git add time
+          current_time=$(TZ='Asia/Shanghai' date "+%Y-%m-%d %H:%M:%S")
+          git commit -m "运行时间 - 北京时间: $current_time"
+          git push origin main
