@@ -5,7 +5,7 @@ on:
     branches:
       - main
   schedule:
-    - cron: "13 7 */7 * *"  # 每 7 天的 7:13 AM 触发
+    - cron: "24 11 */7 * *"  # 每 7 天的 7:13 AM 触发
 
 jobs:
   request-cert:
@@ -42,9 +42,29 @@ jobs:
           RENEW_OPTION: ${{ secrets.RENEW_OPTION }}  # 从环境变量读取续订选项
         run: |
           CERT_PATH="${CERT_PATH:-certs}"  # 默认为 certs
-          RENEW_OPTION="${RENEW_OPTION:-renew}"  # 默认为 renew
           
-          lego --email="$EMAIL" --domains="$DOMAIN" --path="./$CERT_PATH"  --dns alidns $RENEW_OPTION
+          # 检查 RENEW_OPTION 是否为空
+          if [ -z "$RENEW_OPTION" ]; then
+            RENEW_OPTION="renew"  # 默认为 renew
+          fi
+
+          # 当 RENEW_OPTION 为 run 时
+          if [ "$RENEW_OPTION" == "run" ]; then
+            # 检查 CERT_PATH 是否存在，不存在则创建
+            if [ ! -d "$CERT_PATH" ]; then
+              mkdir -p "$CERT_PATH"
+              lego --email="$EMAIL" --domains="$DOMAIN" --path="$CERT_PATH" --dns alidns --accept-tos $RENEW_OPTION
+            else
+              # 检查 CERT_PATH/accounts/ 文件夹下是否有文件
+              if [ -d "$CERT_PATH/accounts/" ] && [ "$(ls -A $CERT_PATH/accounts/)" ]; then
+                # 删除 CERT_PATH/certificates/ 下的所有内容
+                rm -rf "$CERT_PATH/certificates/*"
+                lego --email="$EMAIL" --domains="$DOMAIN" --path="$CERT_PATH" --dns alidns --accept-tos $RENEW_OPTION
+              fi
+            fi
+          else
+            lego --email="$EMAIL" --domains="$DOMAIN" --path="$CERT_PATH" --dns alidns $RENEW_OPTION
+          fi
 
       # 检查续签证书文件是否变更
       - name: 检查续签证书文件是否变更
@@ -63,18 +83,6 @@ jobs:
             echo "未检测到证书变更."
             echo "changed=false" >> $GITHUB_ENV
           fi
-
-      # 将续签证书提交并推送到 Github
-      - name: 将续签证书提交并推送到 Github
-        if: env.changed == 'true'
-        env:
-          CERT_PATH: ${{ secrets.CERT_PATH }}  # 从环境变量读取证书路径
-        run: |
-          CERT_PATH="${CERT_PATH:-certs}"  # 默认为 certs
-          git add $CERT_PATH
-          current_time=$(TZ='Asia/Shanghai' date "+%Y-%m-%d %H:%M:%S")
-          git commit -m "证书更新时间 - 北京时间: $current_time"
-          git push origin main
 
       # 安装阿里云 CLI 为上传证书更新ESA证书做准备
       - name: 安装阿里云 CLI 为上传证书更新ESA证书做准备
@@ -108,7 +116,12 @@ jobs:
         if: env.changed == 'true'
         run: |
           CertId=${{ env.CertId }}
-          aliyun cas DeleteUserCertificate --CertId "${CertId}"
+          if [ -n "$CertId" ]; then
+            echo "正在删除证书，CertId: $CertId"
+            aliyun cas DeleteUserCertificate --CertId "$CertId"
+          else
+            echo "未找到 CertId，跳过删除证书步骤."
+          fi
 
       # 将新证书上传到阿里云并将执行日志写入 ssl-certid 文件
       - name: 将新证书上传到阿里云并将执行日志写入 ssl-certid 文件
@@ -136,39 +149,50 @@ jobs:
             --Key "$(cat ./$CERT_PATH/certificates/${FILENAME}.key)" \
             --Name "$NAME" > ssl-certid
 
-      # 将 ssl-certid 文件上传到 GitHub
-      - name: 上传 ssl-certid 到 GitHub
-        if: env.changed == 'true'
-        run: |
-          git add ssl-certid
-          current_time=$(TZ='Asia/Shanghai' date "+%Y-%m-%d %H:%M:%S")
-          git commit -m "更新时间 - 北京时间: $current_time"
-          git push origin main
-
-      # 读取 SITE_ID 环境变量并写入 site-id 文件
-      - name: 读取 SITE_ID 环境变量并写入 site-id 文件为之后更新 SITE_ID 变量做准备 
+      # 删除旧的 ESA 绑定证书
+      - name: 删除旧的 ESA 绑定证书
         if: env.changed == 'true'
         env:
           SITE_ID: ${{ secrets.SITE_ID }}  # 从环境变量读取 SITE-ID
+          ALIYUN_REGION: ${{ secrets.ALIYUN_REGION }}  # 从环境变量读取区域
         run: |
-          echo "$SITE_ID" > site-id
+          # 安装 jq
+          sudo apt-get install -y jq
 
-      # 检查 site-id 文件是否有变更并上传
-      - name: 检查并上传 site-id 到 GitHub
-        if: env.changed == 'true'
-        run: |
-          set +e  # 忽略错误
-          # 检查 site-id 文件是否有变化
-          git diff --exit-code site-id
-          if [ $? -ne 0 ]; then
-            echo "site-id 文件已更改."
-            git add site-id
-            current_time=$(TZ='Asia/Shanghai' date "+%Y-%m-%d %H:%M:%S")
-            git commit -m "更新时间 - 北京时间: $current_time"
-            git push origin main
-          else
-            echo "未检测到 site-id 文件变更. 跳过上传."
-          fi
+          REGION="${ALIYUN_REGION:-ap-southeast-1}"  # 默认为 ap-southeast-1
+
+          # 过滤掉注释和空行，然后将 ID 转换为数组
+          site_ids=$(echo "$SITE_ID" | grep -v '^#' | grep -v '^ ' | tr '\n' ',' | sed 's/,$//')
+          IFS=',' read -r -a site_ids_array <<< "$site_ids"
+
+          # 显示变量的值
+          echo "站点 ID: ${site_ids_array[@]}"
+          
+          # 遍历 site_ids 数组并执行命令
+          for site_id in "${site_ids_array[@]}"; do
+            echo "正在为站点 ID 执行命令: $site_id"
+
+            # 获取证书列表
+            while true; do
+                response=$(aliyun esa ListCertificates --SiteId "$site_id" --PageSize 1 --PageNumber 1)
+                echo "获取的证书列表: $response"  # 调试输出
+                
+                # 使用 jq 提取证书数量和 ID
+                total_count=$(echo "$response" | jq '.TotalCount')
+
+                if [ "$total_count" -gt 2 ]; then
+                  cert_id=$(echo "$response" | jq -r '.Result[0].Id')
+                  echo "找到需要删除的证书 ID: $cert_id"
+
+                  # 删除证书
+                  aliyun esa DeleteCertificate --SiteId "$site_id" --Id "$cert_id"
+                  echo "已删除证书 ID: $cert_id"
+                else
+                  echo "证书数量小于或等于 2，跳过删除."
+                  break  # 跳出循环
+                fi
+            done
+          done
 
       # 读取 ssl-certid 文件内容，获取新的证书 CertId
       - name: 获取新证书的 CertId
@@ -208,6 +232,77 @@ jobs:
            echo "正在为站点 ID 执行命令: $site_id"
            aliyun esa SetCertificate --SiteId "$site_id" --Name "$NAME" --Type cas --CasId "$CertId" --Region "$REGION"
           done
+ 
+       # 将续签证书提交并推送到 Github
+      - name: 将续签证书提交并推送到 Github
+        if: env.changed == 'true'
+        env:
+          CERT_PATH: ${{ secrets.CERT_PATH }}  # 从环境变量读取证书路径
+        run: |
+          CERT_PATH="${CERT_PATH:-certs}"  # 默认为 certs
+          git add $CERT_PATH
+          current_time=$(TZ='Asia/Shanghai' date "+%Y-%m-%d %H:%M:%S")
+          git commit -m "证书更新时间 - 北京时间: $current_time"
+          git push origin main
+ 
+       # 将 ssl-certid 文件上传到 GitHub
+      - name: 上传 ssl-certid 到 GitHub
+        if: env.changed == 'true'
+        run: |
+          git add ssl-certid
+          current_time=$(TZ='Asia/Shanghai' date "+%Y-%m-%d %H:%M:%S")
+          git commit -m "证书更新时间 - 北京时间: $current_time"
+          git push origin main
+
+      # 读取 SITE_ID 环境变量并写入 site-id 文件
+      - name: 读取 SITE_ID 环境变量并写入 site-id 文件为之后更新 SITE_ID 变量做准备 
+        if: env.changed == 'true'
+        env:
+          SITE_ID: ${{ secrets.SITE_ID }}  # 从环境变量读取 SITE-ID
+        run: |
+          echo "$SITE_ID" > site-id
+
+      # 检查 site-id 文件是否有变更并上传
+      - name: 检查并上传 site-id 到 GitHub
+        if: env.changed == 'true'
+        run: |
+          set +e  # 忽略错误
+          # 检查 site-id 文件是否有变化
+          git diff --exit-code site-id
+          if [ $? -ne 0 ]; then
+            echo "site-id 文件已更改."
+            git add site-id
+            current_time=$(TZ='Asia/Shanghai' date "+%Y-%m-%d %H:%M:%S")
+            git commit -m "更新时间 - 北京时间: $current_time"
+            git push origin main
+          else
+            echo "未检测到 site-id 文件变更. 跳过上传."
+          fi
+
+      # 读取 DOMAIN 环境变量并写入 domain 文件
+      - name: 读取 DOMAIN 环境变量并写入 domain 文件为之后更新 DOMAIN 变量做准备 
+        if: env.changed == 'true'
+        env:
+          DOMAIN: ${{ secrets.DOMAIN }}  # 从环境变量读取 SITE-ID
+        run: |
+          echo "$DOMAIN" > domain
+
+      # 检查 domain 文件是否有变更并上传
+      - name: 检查并上传 domain 到 GitHub
+        if: env.changed == 'true'
+        run: |
+          set +e  # 忽略错误
+          # 检查 domain 文件是否有变化
+          git diff --exit-code domain
+          if [ $? -ne 0 ]; then
+            echo "domain 文件已更改."
+            git add domain
+            current_time=$(TZ='Asia/Shanghai' date "+%Y-%m-%d %H:%M:%S")
+            git commit -m "域名更新时间 - 北京时间: $current_time"
+            git push origin main
+          else
+            echo "未检测到 domain 文件变更. 跳过上传."
+          fi
           
       # 写入时间到文件
       - name: 将当前时间写入文件
