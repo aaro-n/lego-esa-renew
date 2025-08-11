@@ -5,6 +5,7 @@ services:
     image: lego-esa-renew
     container_name: lego-esa-renew
     environment:
+      # 以下是Lego运行所需要的变量，请根据自己的需求进行调整
       # 设置申请的证书存储在 certs 文件夹
       - CERT_PATH=certs
       # 设置 Lego 用阿里云DNS申请通配符证书，具体请参考 Lego文档
@@ -18,6 +19,7 @@ services:
       # 参数： run 或 renew
       # 首次申请证书使用 run
       - RENEW_OPTION=run
+      # 以下变量是上传到阿里云所需要的变量
       # 阿里云上传并更新 ESA 所需要的参数
       - ALICLOUD_ACCESS_KEY_ID=werrt
       - ALICLOUD_ACCESS_KEY_SECRET=ssdsdfffg
